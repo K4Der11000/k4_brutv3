@@ -1,227 +1,96 @@
-from flask import Flask, render_template_string, request, jsonify, redirect, url_for, session
-import threading
+from flask import Flask, render_template, request, redirect, send_from_directory
 import time
+import threading
+import os
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'  # Secret for storing the session
 
-# Password
-PASSWORD = 'kader11000'
-
+# Global Variables
 guesses = []
 proxies = []
 results = []
-remaining_guess_time = 0
-current_guess_index = 0
 is_guessing_paused = False
-variable_url = ""
+current_guess_index = 0
+remaining_guess_time = 0
+guess_timer_thread = None
 
-# Login page with password
-@app.route('/', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        entered_password = request.form.get('password')
-        if entered_password == PASSWORD:
-            session['authenticated'] = True
-            return redirect(url_for('index'))
-        else:
-            return "Invalid password. Try again.", 403
+# Helper Functions
+def start_guess_timer(duration_in_seconds):
+    global remaining_guess_time
+    remaining_guess_time = duration_in_seconds
+    while remaining_guess_time > 0:
+        if is_guessing_paused:
+            break
+        time.sleep(1)
+        remaining_guess_time -= 1
 
-    return render_template_string("""
-    <html><head><title>Login</title></head>
-    <body>
-        <h2>Enter Password</h2>
-        <form method="POST">
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Login</button>
-        </form>
-    </body></html>
-    """)
-
-# Ensure that the user is logged in
-def require_authentication():
-    if not session.get('authenticated'):
-        return redirect(url_for('login'))
-
-# Route to render the main page
-@app.route('/app', methods=['GET'])
+@app.route("/", methods=["GET", "POST"])
 def index():
-    if require_authentication():
-        return require_authentication()
-    
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html lang="en" dir="ltr">
-    <head>
-      <meta charset="UTF-8">
-      <title>Advanced URL Guessing Tool</title>
-      <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        textarea, input, button, select { background-color: #111; color: #0f0; border: 1px solid #0f0; padding: 8px; margin: 5px 0; width: 100%; border-radius: 6px; }
-        button { cursor: pointer; }
-        #guessOutput { background-color: #111; border: 1px solid #0f0; padding: 10px; margin-top: 20px; height: 200px; overflow-y: scroll; }
-        #guessTimerBanner { display: none; background: #111; color: #0f0; padding: 6px 10px; border-top: 2px solid #0f0; font-weight: bold; text-align: center; margin-top: 10px; }
-        #resultButtons { margin-top: 10px; text-align: center; }
-        .result-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        .result-table th, .result-table td { border: 1px solid #0f0; padding: 6px; text-align: center; }
-        .result-table th { background-color: #060; }
-        .result-table td { background-color: #020; }
-      </style>
-    </head>
-    <body>
+    global guesses, proxies, current_guess_index, is_guessing_paused, results, guess_timer_thread
 
-    <h2>URL Guessing Tool</h2>
+    if request.method == "POST":
+        if "start" in request.form:
+            # Start guessing
+            guesses = request.form["guess_list"].splitlines()
+            proxies = request.form["proxy_list"].splitlines()
+            results = []
+            current_guess_index = 0
+            is_guessing_paused = False
 
-    <h3>Target URL</h3>
-    <textarea id="urlInput" placeholder="Enter the URL here...">https://example.com/item/1234/details</textarea>
-    <button onclick="markVariable()">Mark Selected Text as Variable</button>
-    <textarea id="urlWithVariable" readonly placeholder="URL with variable will appear here..."></textarea>
+            # Start guess timer
+            guess_count = len(guesses)
+            estimated_time = guess_count * 0.3  # Estimate time (in seconds)
+            guess_timer_thread = threading.Thread(target=start_guess_timer, args=(estimated_time,))
+            guess_timer_thread.start()
 
-    <h3>Guess List</h3>
-    <textarea id="guessList" placeholder="Enter the guesses here..."></textarea>
+            # Start guessing loop
+            threading.Thread(target=start_guess_loop).start()
 
-    <h3>Proxy List (Optional)</h3>
-    <textarea id="proxyList" placeholder="Enter proxies here..."></textarea>
+        elif "pause_resume" in request.form:
+            # Pause/Resume guessing
+            is_guessing_paused = not is_guessing_paused
 
-    <div>
-      <button onclick="startGuessing()">Start Guessing</button>
-      <button id="pauseResumeBtn" onclick="togglePauseGuessing()">Pause</button>
-    </div>
+        elif "save" in request.form:
+            # Save results
+            save_results()
+            return redirect(url_for('download_results'))
 
-    <div id="guessTimerBanner">Time Remaining: <span id="guessTimeLeft">--:--</span></div>
+        return redirect(url_for("index"))
 
-    <div id="resultButtons">
-      <button onclick="showResults()">Show Results</button>
-      <button onclick="saveResults()">Save Results</button>
-    </div>
+    return render_template("index.html", guesses=guesses, proxies=proxies, results=results, 
+                           remaining_guess_time=remaining_guess_time)
 
-    <div id="guessOutput"></div>
+def start_guess_loop():
+    global current_guess_index, results, guesses, proxies
+    while current_guess_index < len(guesses):
+        if is_guessing_paused:
+            break
+        guess = guesses[current_guess_index]
+        proxy = proxies[current_guess_index % len(proxies)] if proxies else "-"
+        simulate_guess(guess, proxy)
+        results.append({"guess": guess, "proxy": proxy, "status": "Done"})
+        current_guess_index += 1
+        time.sleep(0.3)  # Simulate delay for each guess
 
-    <script>
-    let isGuessingPaused = false;
-    let guessInterval = null;
-    let guessTimerInterval = null;
-    let remainingGuessTime = 0;
-    let currentGuessIndex = 0;
-    let guesses = [];
-    let proxies = [];
-    let results = [];
-    let variableUrl = "";  // Variable for holding the modified URL with {{VAR}}
+def simulate_guess(guess, proxy):
+    # Simulate the guessing process in the web interface
+    print(f"[+] Attempting: {guess} with proxy {proxy if proxy != '-' else 'None'}")
 
-    function getGuessList() {
-      const raw = document.getElementById("guessList").value;
-      return raw.split("\n").map(x => x.trim()).filter(x => x);
-    }
+def save_results():
+    # Save results to an HTML file
+    html_content = "<html><head><title>Guessing Results</title></head><body>"
+    html_content += "<h2>Guessing Results</h2><table border='1'><tr><th>Index</th><th>Guess</th><th>Proxy</th><th>Status</th></tr>"
 
-    function getProxyList() {
-      const raw = document.getElementById("proxyList").value;
-      return raw.split("\n").map(x => x.trim()).filter(x => x);
-    }
+    for idx, result in enumerate(results):
+        html_content += f"<tr><td>{idx + 1}</td><td>{result['guess']}</td><td>{result['proxy']}</td><td>{result['status']}</td></tr>"
 
-    function markVariable() {
-      const urlInput = document.getElementById("urlInput");
-      const urlWithVar = document.getElementById("urlWithVariable");
-      const start = urlInput.selectionStart;
-      const end = urlInput.selectionEnd;
+    html_content += "</table></body></html>"
+    with open("results.html", "w") as file:
+        file.write(html_content)
 
-      if (start === end) {
-        alert("Please select the part of the URL to be replaced with a variable.");
-        return;
-      }
+@app.route("/download")
+def download_results():
+    return send_from_directory(os.getcwd(), 'results.html')
 
-      const original = urlInput.value;
-      const selected = original.substring(start, end);
-      const modified = original.substring(0, start) + "{{VAR}}" + original.substring(end);
-
-      urlWithVar.value = modified;
-
-      variableUrl = modified;  // Save the modified URL for use later
-    }
-
-    function startGuessing() {
-      guesses = getGuessList();
-      proxies = getProxyList();
-      currentGuessIndex = 0;
-      results = [];
-
-      const guessCount = guesses.length;
-      const estimatedTime = Math.ceil(guessCount * 0.3 / Math.max(proxies.length || 1, 1));
-      remainingGuessTime = estimatedTime;
-
-      startGuessTimer(remainingGuessTime);
-      startGuessLoop();
-    }
-
-    function startGuessLoop() {
-      isGuessingPaused = false;
-
-      if (guessInterval) clearInterval(guessInterval);
-      guessInterval = setInterval(() => {
-        if (isGuessingPaused || currentGuessIndex >= guesses.length) return;
-
-        const guess = guesses[currentGuessIndex];
-        const proxy = proxies[currentGuessIndex % (proxies.length || 1)] || "-";
-
-        simulateGuess(guess, proxy);
-
-        results.push({ guess, proxy, status: "Completed" });
-        currentGuessIndex++;
-
-        if (currentGuessIndex >= guesses.length) {
-          clearInterval(guessInterval);
-        }
-      }, 300);
-    }
-
-    function simulateGuess(guess, proxy) {
-      const terminal = document.getElementById("guessOutput");
-      const url = variableUrl.replace("{{VAR}}", guess);  // Replace the {{VAR}} placeholder with the guess
-      terminal.innerHTML += `<div style="color:#0f0;">[+]: Tested: ${url} ${proxy !== "-" ? ' via ' + proxy : ''}</div>`;
-      terminal.scrollTop = terminal.scrollHeight;
-    }
-
-    function startGuessTimer(durationInSeconds) {
-      const banner = document.getElementById("guessTimerBanner");
-      const text = document.getElementById("guessTimeLeft");
-
-      remainingGuessTime = durationInSeconds;
-      banner.style.display = "block";
-
-      if (guessTimerInterval) clearInterval(guessTimerInterval);
-      guessTimerInterval = setInterval(() => {
-        if (!isGuessingPaused && remainingGuessTime > 0) {
-          remainingGuessTime--;
-          let m = Math.floor(remainingGuessTime / 60);
-          let s = remainingGuessTime % 60;
-          text.textContent = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-        }
-
-        if (remainingGuessTime <= 0) {
-          clearInterval(guessTimerInterval);
-          text.textContent = "00:00";
-          setTimeout(() => banner.style.display = "none", 3000);
-        }
-      }, 1000);
-    }
-
-    function togglePauseGuessing() {
-      const btn = document.getElementById("pauseResumeBtn");
-      isGuessingPaused = !isGuessingPaused;
-      btn.textContent = isGuessingPaused ? "Resume" : "Pause";
-      btn.style.backgroundColor = isGuessingPaused ? "#550" : "#222";
-    }
-
-    function showResults() {
-      const win = window.open("", "_blank");
-      let html = `
-      <html><head><title>Guessing Results</title>
-      <style>
-        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { border: 1px solid #0f0; padding: 8px; text-align: center; }
-        th { background-color: #060; }
-        td { background-color: #020; }
-      </style></head><body>
-      <h2>Guessing Results</h2>
-      <table>
-        <
+if __name__ == "__main__":
+    app.run(debug=True)
